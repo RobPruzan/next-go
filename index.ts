@@ -29,29 +29,56 @@ function viewerHTML() {
   <iframe id="view"></iframe>
 
   <script type="module">
+    console.log("Viewer script starting...");
     const WS_URL = location.origin.replace(/^http/, "ws");  // -> wss://…
+    console.log("WebSocket URL:", WS_URL);
     const pc = new RTCPeerConnection({ iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
+    console.log("RTCPeerConnection created");
 
     /* incoming data‑channel delivers the HTML string */
     pc.ondatachannel = ev => {
+      console.log("Data channel received:", ev.channel.label);
       ev.channel.onmessage = m => {
+        console.log("Message received on data channel");
         const {kind, payload} = JSON.parse(m.data);
-        if (kind === "html") document.getElementById("view").srcdoc = payload;
+        console.log("Message kind:", kind);
+        if (kind === "html") {
+          console.log("Setting HTML content to iframe");
+          document.getElementById("view").srcdoc = payload;
+        }
       };
     };
 
     const ws = new WebSocket(WS_URL);
-    ws.onopen = () => ws.send(JSON.stringify({ type:"join", role:"client" }));
+    console.log("WebSocket connection initiated");
+    
+    ws.onopen = () => {
+      console.log("WebSocket connection opened, joining as client");
+      ws.send(JSON.stringify({ type:"join", role:"client" }));
+    };
 
     ws.onmessage = async ev => {
+      console.log("WebSocket message received");
       const msg = JSON.parse(ev.data);
+      console.log("Message type:", msg.type);
+      
       if (msg.type === "offer") {
+        console.log("Processing offer from host");
         await pc.setRemoteDescription(msg.offer);
+        console.log("Remote description set");
+        
         const answer = await pc.createAnswer();
+        console.log("Answer created");
+        
         await pc.setLocalDescription(answer);
+        console.log("Local description set");
+        
         ws.send(JSON.stringify({ type:"answer", answer }));
+        console.log("Answer sent to host");
       } else if (msg.type === "ice") {
+        console.log("Adding ICE candidate");
         await pc.addIceCandidate(msg.candidate);
+        console.log("ICE candidate added");
       }
     };
   </script>
