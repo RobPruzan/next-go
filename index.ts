@@ -1,34 +1,27 @@
-// bun run relay-server.ts
+// bun run relay-server.ts               (Railway sets PORT)
 import { nanoid } from "nanoid";
 import type { ServerWebSocket } from "bun";
 
-/* ------------------------------------------------------------------ */
-/*  State and helpers                                                 */
-/* ------------------------------------------------------------------ */
+/* ───────── types & in‑memory state ───────── */
 type Role = "host" | "client";
 interface Meta { role?: Role; id?: string }
 
 let host: ServerWebSocket<Meta> | undefined;
 const clients = new Map<string, ServerWebSocket<Meta>>();
 
-/* outgoing buffers while the receiver is offline */
-const toHost: string[] = [];
+/* message buffers while the target is offline */
+const toHost: string[]                 = [];
 const toClient: Record<string, string[]> = {};
 
-function log(id: string, msg: string) {
-  console.log(`[relay] ${id}: ${msg}`);
-}
+const log = (id: string, msg: string) => console.log(`[relay] ${id}: ${msg}`);
 
-/* ------------------------------------------------------------------ */
-/*  Pretty viewer HTML served at https://next-go-production.up...     */
-/* ------------------------------------------------------------------ */
+/* ───────── viewer page (served over HTTPS) ───────── */
 const viewerHTML = /* html */ `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Live Viewer</title>
-
+  <title>Live Viewer</title>
   <style>
     html,body { margin:0; height:100%; background:#111; color:#0f0; font-family:monospace }
     #view     { width:100%; height:100%; border:none }
@@ -36,7 +29,6 @@ const viewerHTML = /* html */ `
                 border-radius:6px; font-size:12px; line-height:1.4; max-width:60vw }
     #log      { position:fixed; bottom:0; left:0; right:0; max-height:45vh; overflow:auto;
                 background:#000; margin:0; padding:6px 8px; font-size:11px; line-height:1.4 }
-    #log code { color:#8f8; }
   </style>
 </head>
 <body>
@@ -45,81 +37,82 @@ const viewerHTML = /* html */ `
   <pre id="log"></pre>
 
   <script type="module">
-    /* ---------------- small console helper ----------------------------- */
-    const logEl = document.getElementById('log');
-    function log(...a) {
-      const line = a.join(' ');
-      logEl.insertAdjacentHTML('beforeend', line + '\\n');
-      logEl.scrollTop = logEl.scrollHeight;
-      console.log(...a);
-    }
     const hud = document.getElementById('hud');
-    const step = (s) => { hud.textContent = s; log('[status]', s); };
+    const logBox = document.getElementById('log');
+    const log = (...a) => {
+      logBox.textContent += a.join(' ') + '\\n';
+      logBox.scrollTop = logBox.scrollHeight;
+      console.log(...a);
+    };
+    const step = s => { hud.textContent = s; log('[status]', s); };
 
-    /* ---------------- signalling -------------------------------------- */
+    /* ---------- signalling ---------- */
     const WS_URL = location.origin.replace(/^http/, 'ws');
     log('[ws] url', WS_URL);
     const ws = new WebSocket(WS_URL);
 
-    /* ---------------- peer connection --------------------------------- */
+    /* ---------- peer connection ------ */
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
     });
     pc.onconnectionstatechange = () => log('[pc] state', pc.connectionState);
 
-    /* outgoing ICE */
-    function sendICE(cand) {
-      if (clientId) ws.send(JSON.stringify({ type: 'ice', id: clientId, candidate: cand }));
-    }
-    pc.onicecandidate = (e) => e.candidate && clientId && sendICE(e.candidate);
+    let myId = null;
 
-    /* data‑channel handlers */
-    let clientId = null;
-    pc.ondatachannel = (ev) => {
+    /* ICE → relay */
+    pc.onicecandidate = e => {
+      if (e.candidate && myId)
+        ws.send(JSON.stringify({ type: 'ice', id: myId, candidate: e.candidate }));
+    };
+
+    /* incoming data channel */
+    pc.ondatachannel = ev => {
       const dc = ev.channel;
       log('[data] channel', dc.label);
+
       dc.onopen = () => {
         log('[data] open');
         step('data‑channel open – waiting for HTML…');
-        ws.send(JSON.stringify({ type: 'data-open', id: clientId }));
+        ws.send(JSON.stringify({ type: 'data-open', id: myId }));
       };
-      dc.onmessage = (ev2) => {
+
+      dc.onmessage = ev2 => {
         const { kind, payload } = JSON.parse(ev2.data);
         log('[data] message', kind);
         if (kind === 'html') {
           document.getElementById('view').srcdoc = payload;
-          ws.send(JSON.stringify({ type: 'html-ack', id: clientId }));
-          step('HTML applied ✔︎');
+          ws.send(JSON.stringify({ type: 'html-ack', id: myId }));
+          step('HTML applied ✔');
         }
       };
     };
 
-    /* ---------------- WebSocket --------------------------------------- */
+    /* WebSocket flow */
     ws.onopen = () => {
       log('[ws] open');
-      step('websocket open – joining…');
+      step('WebSocket open – joining…');
       ws.send(JSON.stringify({ type: 'join', role: 'client' }));
     };
 
-    ws.onmessage = async (ev) => {
-      const msg = JSON.parse(ev.data);
+    ws.onmessage = async ev => {
+      const m = JSON.parse(ev.data);
 
-      if (msg.type === 'client-id') {
-        clientId = msg.id;
-        step('client id: ' + clientId);
+      if (m.type === 'client-id') {
+        myId = m.id;
+        step('client id: ' + myId);
         return;
       }
-      if (msg.id !== clientId) return; // ignore others
+      if (m.id !== myId) return;
 
-      if (msg.type === 'offer') {
+      if (m.type === 'offer') {
         step('offer received');
-        await pc.setRemoteDescription(msg.offer);
+        await pc.setRemoteDescription(m.offer);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({ type: 'answer', id: clientId, answer }));
+        ws.send(JSON.stringify({ type: 'answer', id: myId, answer }));
         step('answer sent');
-      } else if (msg.type === 'ice') {
-        await pc.addIceCandidate(msg.candidate);
+      } else if (m.type === 'ice') {
+        await pc.addIceCandidate(m.candidate);
         log('[sig] ice');
       }
     };
@@ -128,25 +121,23 @@ const viewerHTML = /* html */ `
 </html>
 `;
 
-/* ------------------------------------------------------------------ */
-/*  Bun server (HTTP + WebSocket)                                     */
-/* ------------------------------------------------------------------ */
+/* ───────── Bun server (HTTP + WS) ───────── */
 Bun.serve<Meta>({
   port: Number(process.env.PORT) || 5050,
 
-  /* ---------- HTTP ---------------------------------------------------- */
+  /* HTTP → serve viewer page */
   fetch(req, srv) {
     if (srv.upgrade(req)) return;
     return new Response(viewerHTML, { headers: { "content-type": "text/html" } });
   },
 
-  /* ---------- WebSocket ---------------------------------------------- */
   websocket: {
-    message(ws, data) {
-      const txt = typeof data === "string" ? data : data.toString();
+    /* ── message handler ─────────────────────────────────────────────── */
+    message(ws, raw) {
+      const txt = typeof raw === "string" ? raw : raw.toString();
       const msg = JSON.parse(txt);
 
-      /* --- join handshake --------------------------------------------- */
+      /* ----- join handshake ----- */
       if (msg.type === "join") {
         if (msg.role === "host") {
           host = ws;
@@ -154,11 +145,14 @@ Bun.serve<Meta>({
           log("host", "ws-connected");
           toHost.splice(0).forEach(p => host!.send(p));
         } else {
-          /* new client */
           const id = nanoid(5);
           ws.data = { role: "client", id };
           clients.set(id, ws);
+
+          /* flush anything already queued for this client */
+          (toClient[id] ?? []).forEach(p => ws.send(p));
           toClient[id] = [];
+
           ws.send(JSON.stringify({ type: "client-id", id }));
           const notice = JSON.stringify({ type: "client-join", id });
           host ? host.send(notice) : toHost.push(notice);
@@ -167,33 +161,29 @@ Bun.serve<Meta>({
         return;
       }
 
-      /* --- proxy or buffer -------------------------------------------- */
+      /* ----- forward or buffer ----- */
       if (ws.data?.role === "host") {
-        /* from host → to ONE client */
+        /* host → specific client */
         const target = clients.get(msg.id);
-        if (target) {
-          target.send(txt);
-        } else {
-          (toClient[msg.id] ||= []).push(txt);
-        }
-        log(msg.id, `relay→client:${msg.type}`);
+        if (target) target.send(txt);
+        else (toClient[msg.id] ||= []).push(txt);
+        log(msg.id, "relay→client:" + msg.type);
       } else {
-        /* from client → host*/
+        /* client → host */
         const id = ws.data!.id!;
-        msg.id = id;                       // tag sender
+        msg.id = id;
         const payload = JSON.stringify(msg);
-        if (host) host.send(payload); else toHost.push(payload);
-        log(id, `relay→host:${msg.type}`);
+        host ? host.send(payload) : toHost.push(payload);
+        log(id, "relay→host:" + msg.type);
       }
     },
 
+    /* ── cleanup on close ────────────────────────────────────────────── */
     close(ws) {
       if (ws === host) {
         host = undefined;
         log("host", "ws-closed");
-        return;
-      }
-      if (ws.data?.role === "client") {
+      } else if (ws.data?.role === "client") {
         const id = ws.data.id!;
         clients.delete(id);
         delete toClient[id];
