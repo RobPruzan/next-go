@@ -5,7 +5,9 @@
   "scripts": {
     "start": "bun run index.ts"
   },
-  "dependencies": {},
+  "dependencies": {
+    "nanoid": "^5.1.5"
+  },
   "devDependencies": {
     "bun-types": "latest"
   },

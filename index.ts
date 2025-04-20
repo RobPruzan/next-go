@@ -1,170 +1,126 @@
-// bun run relay-server.ts   — Railway will inject PORT
+// bun run relay-server.ts   (Railway injects PORT)
+import { nanoid } from "nanoid";
 import type { ServerWebSocket } from "bun";
 
-/* ------------------------------------------------------------------ */
-/*  Types & globals                                                   */
-/* ------------------------------------------------------------------ */
 type Role = "host" | "client";
-type Meta = { role?: Role };
+type Meta = { role?: Role; id?: string };
 
-let host:   ServerWebSocket<Meta> | undefined;
-let client: ServerWebSocket<Meta> | undefined;
+let host: ServerWebSocket<Meta> | undefined;
+const clients = new Map<string, ServerWebSocket<Meta>>();
 
-/* queued messages while the other side is absent */
-let toHost:   string[] = [];
-let toClient: string[] = [];
+/* buffers while the other side is offline -------------------------------- */
+let toHost: string[] = [];
+const toClient: Record<string, string[]> = {};
 
-/* ------------------------------------------------------------------ */
-/*  Viewer HTML (phone loads this over HTTPS)                          */
-/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------------ */
+/* Viewer page (mobile)                                                     */
+/* ------------------------------------------------------------------------ */
 const viewerHTML = /*html*/ `
 <!doctype html><html><head><meta charset="utf-8"/>
-  <title>Live Viewer</title>
-  <style>html,body{margin:0;height:100%;background:#111}
-        #view{width:100%;height:100%;border:none}</style>
+<title>Live Viewer</title>
+<style>html,body{margin:0;height:100%;background:#111}#view{width:100%;height:100%;border:none}</style>
 </head><body>
-  <iframe id="view"></iframe>
-  <script type="module">
-    console.log("[viewer] boot");
-    const WS_URL = location.origin.replace(/^http/, "ws");
-    console.log("[viewer] connecting to WebSocket:", WS_URL);
-    
-    const pc = new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
-    console.log("[viewer] created RTCPeerConnection");
-    
-    pc.ondatachannel = ev => {
-      console.log("[viewer] data channel received");
-      ev.channel.onmessage = ({data}) => {
-        console.log("[viewer] data channel message received");
-        const {kind,payload} = JSON.parse(data);
-        if(kind==="html") {
-          console.log("[viewer] received HTML content");
-          document.getElementById("view").srcdoc = payload;
-        }
-      };
+<iframe id="view"></iframe>
+<script type="module">
+  const WS_URL = location.origin.replace(/^http/, "ws");
+  const pc = new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
+  let myId = null;
+
+  pc.ondatachannel = ev => {
+    ev.channel.onmessage = ({data})=>{
+      const {kind,payload} = JSON.parse(data);
+      if(kind==="html") document.getElementById("view").srcdoc = payload;
     };
-    
-    const ws = new WebSocket(WS_URL);
-    
-    ws.onopen = () => {
-      console.log("[viewer] WebSocket connected, joining as client");
-      ws.send(JSON.stringify({type:"join",role:"client"}));
-    };
-    
-    ws.onmessage = async ({data}) => {
-      const m = JSON.parse(data);
-      console.log("[viewer] WebSocket message received:", m.type);
-      
-      if(m.type==="offer"){
-        console.log("[viewer] processing offer");
-        await pc.setRemoteDescription(m.offer);
-        console.log("[viewer] creating answer");
-        const ans = await pc.createAnswer();
-        console.log("[viewer] setting local description");
-        await pc.setLocalDescription(ans);
-        console.log("[viewer] sending answer");
-        ws.send(JSON.stringify({type:"answer",answer:ans}));
-      } else if(m.type==="ice"){
-        console.log("[viewer] adding ICE candidate");
-        await pc.addIceCandidate(m.candidate);
-      }
-    };
-    
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        console.log("[viewer] ICE candidate generated");
-        ws.send(JSON.stringify({type:"ice",candidate:e.candidate}));
-      }
-    };
-    
-    pc.onconnectionstatechange = () => {
-      console.log("[viewer] connection state:", pc.connectionState);
-    };
-  </script>
+  };
+
+  const ws = new WebSocket(WS_URL);
+  ws.onopen = ()=>ws.send(JSON.stringify({type:"join",role:"client"}));
+
+  ws.onmessage = async ev=>{
+    const m = JSON.parse(ev.data);
+    if(m.type==="client-id"){ myId = m.id; return; }
+    if(m.id && m.id!==myId) return;          // ignore foreign traffic
+
+    if(m.type==="offer"){
+      await pc.setRemoteDescription(m.offer);
+      const ans = await pc.createAnswer();
+      await pc.setLocalDescription(ans);
+      ws.send(JSON.stringify({type:"answer",id:myId,answer:ans}));
+    }else if(m.type==="ice"){
+      await pc.addIceCandidate(m.candidate);
+    }
+  };
+
+  pc.onicecandidate = e=>{
+    if(e.candidate && myId)
+      ws.send(JSON.stringify({type:"ice",id:myId,candidate:e.candidate}));
+  };
+</script>
 </body></html>`;
 
-/* ------------------------------------------------------------------ */
-/*  Bun server (HTTP + WebSocket)                                      */
-/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------------ */
+/* Relay logic                                                              */
+/* ------------------------------------------------------------------------ */
 Bun.serve<Meta>({
   port: Number(process.env.PORT) || 5050,
 
   fetch(req, srv) {
-    console.log(`HTTP request: ${req.method} ${req.url}`);
-    /* upgrade → WS ; otherwise serve viewer page */
-    if (srv.upgrade(req)) {
-      console.log(`WebSocket upgrade for ${req.url}`);
-      return;
-    }
-    console.log(`Serving viewer HTML to ${req.headers.get("user-agent")}`);
-    return new Response(viewerHTML, { headers: { "content-type": "text/html" }});
+    if (srv.upgrade(req)) return;
+    return new Response(viewerHTML, { headers: { "content-type": "text/html" } });
   },
 
   websocket: {
-    open(ws) {
-      console.log(`WebSocket connection opened, waiting for join message`);
-    },
-
-    /* the very first message must be {type:"join", role:"host"|"client"} */
     message(ws, raw) {
-      const text = typeof raw === "string" ? raw : raw.toString();
-      const msg  = JSON.parse(text);
-      console.log(`WebSocket message received: ${msg.type}`);
+      const txt = typeof raw === "string" ? raw : raw.toString();
+      const msg = JSON.parse(txt);
 
-      /* ------------ handshake ----------------------------------------- */
+      /* ------- Join ----------------------------------------------------- */
       if (msg.type === "join") {
-        ws.data = { role: msg.role as Role };
-        console.log(`Client joined as: ${msg.role}`);
-        
         if (msg.role === "host") {
+          ws.data = { role: "host" };
           host = ws;
-          console.log(`Host connected, ${toHost.length} queued messages`);
-          /* flush anything the phone sent early */
+          /* flush any waiting messages */
           toHost.forEach(p => ws.send(p));
           toHost = [];
-        } else {
-          client = ws;
-          console.log(`Client connected, ${toClient.length} queued messages`);
-          /* flush anything the desktop sent early */
-          toClient.forEach(p => ws.send(p));
-          toClient = [];
+        } else { // client
+          const id = nanoid(6);
+          ws.data = { role: "client", id };
+          clients.set(id, ws);
+          toClient[id] = [];
+
+          /* tell client its id */
+          ws.send(JSON.stringify({ type: "client-id", id }));
+          /* notify host */
+          const notice = JSON.stringify({ type: "client-join", id });
+          host ? host.send(notice) : toHost.push(notice);
         }
         return;
       }
 
-      /* ------------ proxy / queue ------------------------------------- */
+      /* ------- Proxy / queue ------------------------------------------- */
       if (ws.data?.role === "host") {
-        console.log(`Forwarding message from host to client: ${msg.type}`);
-        if (client) {
-          console.log(`Client connected, sending directly`);
-          client.send(text);
-        } else {
-          console.log(`Client not connected, queueing message`);
-          toClient.push(text);
-        }
-      } else { /* sender is client */
-        console.log(`Forwarding message from client to host: ${msg.type}`);
-        if (host) {
-          console.log(`Host connected, sending directly`);
-          host.send(text);
-        } else {
-          console.log(`Host not connected, queueing message`);
-          toHost.push(text);
-        }
+        const target = clients.get(msg.id);
+        (target ?? (toClient[msg.id] ||= [])).push(txt);
+      } else { // sender is a client
+        msg.id = ws.data!.id;                      // tag with sender id
+        const payload = JSON.stringify(msg);
+        host ? host.send(payload) : toHost.push(payload);
       }
     },
 
+    open() {},
+
     close(ws) {
       if (ws === host) {
-        console.log(`Host disconnected`);
         host = undefined;
-      }
-      if (ws === client) {
-        console.log(`Client disconnected`);
-        client = undefined;
+      } else if (ws.data?.role === "client") {
+        const id = ws.data.id!;
+        clients.delete(id);
+        delete toClient[id];
+        host?.send(JSON.stringify({ type: "client-leave", id }));
       }
     },
   },
 });
 
-console.log("🛰️  relay & viewer listening on :", process.env.PORT || 5050);
+console.log("🛰️  relay & viewer ready on :", process.env.PORT || 5050);
