@@ -25,57 +25,105 @@ function log(id: string, msg: string) {
  * --------------------------------------------------------------*/
 const viewerHTML = `<!DOCTYPE html><html><head><meta charset="utf-8"/>
 <title>Live Viewer</title>
-<style>html,body{margin:0;height:100%;background:#111;color:#0f0;font-family:monospace}#view{width:100%;height:100%;border:none}#log{position:fixed;bottom:0;left:0;right:0;max-height:45vh;overflow:auto;background:#000;padding:4px;font-size:11px;line-height:1.4}</style>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #111;
+    color: #0f0;
+    font-family: monospace;
+  }
+  #view {
+    width: 100%;
+    height: 100%;
+    border: none;
+  }
+  #log {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    max-height: 45vh;
+    overflow: auto;
+    background: #000;
+    padding: 4px;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+</style>
 </head><body>
 <iframe id="view"></iframe>
 <pre id="log"></pre>
-<script>(function(){
-  const logEl=document.getElementById('log');
-  const log=(...a)=>{logEl.textContent+=a.join(' ')+'\n';logEl.scrollTop=logEl.scrollHeight;console.log(...a);} ;
+<script>
+(function() {
+  const logEl = document.getElementById('log');
+  const log = (...a) => {
+    logEl.textContent += a.join(' ') + '\\n';
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(...a);
+  };
 
-  const WS_URL=location.origin.replace(/^http/,'ws');
-  log('[ws] url',WS_URL);
+  const WS_URL = location.origin.replace(/^http/, 'ws');
+  log('[ws] url', WS_URL);
 
-  const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-  let id=null; let dc=null;
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  });
+  let id = null;
+  let dc = null;
 
-  pc.onconnectionstatechange=()=>log('[pc] state',pc.connectionState);
-  pc.onicecandidate=e=>{if(e.candidate&&id){ws.send(JSON.stringify({type:'ice',id,candidate:e.candidate}));}};
+  pc.onconnectionstatechange = () => log('[pc] state', pc.connectionState);
+  pc.onicecandidate = e => {
+    if (e.candidate && id) {
+      ws.send(JSON.stringify({type: 'ice', id, candidate: e.candidate}));
+    }
+  };
 
-  pc.ondatachannel=ev=>{
-    dc=ev.channel;
-    log('[data] channel',dc.label);
-    dc.onopen=()=>{log('[data] open');ws.send(JSON.stringify({type:'data-open',id}));};
-    dc.onmessage=ev2=>{
-      const {kind,payload}=JSON.parse(ev2.data);
-      log('[data] message',kind);
-      if(kind==='html'){
-        document.getElementById('view').srcdoc=payload;
-        ws.send(JSON.stringify({type:'html-ack',id}));
+  pc.ondatachannel = ev => {
+    dc = ev.channel;
+    log('[data] channel', dc.label);
+    dc.onopen = () => {
+      log('[data] open');
+      ws.send(JSON.stringify({type: 'data-open', id}));
+    };
+    dc.onmessage = ev2 => {
+      const {kind, payload} = JSON.parse(ev2.data);
+      log('[data] message', kind);
+      if (kind === 'html') {
+        document.getElementById('view').srcdoc = payload;
+        ws.send(JSON.stringify({type: 'html-ack', id}));
         log('[view] html applied');
       }
     };
   };
 
-  const ws=new WebSocket(WS_URL);
-  ws.onopen=()=>{log('[ws] open');ws.send(JSON.stringify({type:'join',role:'client'}));};
-  ws.onmessage=async ev=>{
-    const m=JSON.parse(ev.data);
-    if(m.type==='client-id'){id=m.id;log('[id]',id);return;}
-    if(m.id!==id) return;
-    if(m.type==='offer'){
+  const ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    log('[ws] open');
+    ws.send(JSON.stringify({type: 'join', role: 'client'}));
+  };
+  ws.onmessage = async ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'client-id') {
+      id = m.id;
+      log('[id]', id);
+      return;
+    }
+    if (m.id !== id) return;
+    if (m.type === 'offer') {
       log('[sig] offer');
       await pc.setRemoteDescription(m.offer);
-      const ans=await pc.createAnswer();
+      const ans = await pc.createAnswer();
       await pc.setLocalDescription(ans);
-      ws.send(JSON.stringify({type:'answer',id,answer:ans}));
+      ws.send(JSON.stringify({type: 'answer', id, answer: ans}));
       log('[sig] answer sent');
-    }else if(m.type==='ice'){
+    } else if (m.type === 'ice') {
       await pc.addIceCandidate(m.candidate);
       log('[sig] ice');
     }
   };
-})();</script>
+})();
+</script>
 </body></html>`;
 
 /** --------------------------------------------------------------
