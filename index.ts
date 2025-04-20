@@ -1,449 +1,420 @@
-// bun run relay-server.ts      (Railway sets PORT env var)
-import { nanoid } from "nanoid";
-import type { ServerWebSocket } from "bun";
+import React, { useEffect, useMemo, useState, useRef, useCallback } from "react";
+import QRCode from "qrcode-svg";
 
-/* ───────── Types & In‑memory State ───────── */
+// --- Constants ---
+const VIEWER_URL = "https://next-go-production.up.railway.app"; // URL the QR code points to
+const WS_URL = "wss://next-go-production.up.railway.app";      // URL of your signaling server
+const HTML_URL = "/dummy.html"; // Path to the HTML file to send
 
-type Role = "host" | "client";
-interface WebSocketMeta { role?: Role; id?: string } // Metadata attached to WebSocket connection
+const STUN_SERVERS = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+];
+const RETRY_DELAY_MS = 4000;
+const MAX_HTML_RETRIES = 3;
 
-// Store the single host connection
-let host: ServerWebSocket<WebSocketMeta> | undefined;
-// Store multiple client connections, keyed by their unique ID
-const clients = new Map<string, ServerWebSocket<WebSocketMeta>>();
+// --- Types ---
+type ClientStage =
+    | "connecting" | "ws-connected" | "pc-created" | "offered"
+    | "pc-connected" | "data-open" | "sending-html" | "html-acked"
+    | "failed" | "closed";
 
-/* Message buffers for when the target is temporarily disconnected */
-const messagesForHost: string[] = []; // Queue messages intended for the host
-const messagesForClient: Record<string, string[]> = {}; // Queues messages for specific clients
+interface ClientState {
+    id: string;
+    stage: ClientStage;
+    pcState: RTCPeerConnectionState;
+    iceState: RTCIceConnectionState;
+    sigState: RTCSignalingState;
+    htmlSendRetries: number;
+    // We store PC/DC in a Ref, not directly in state
+    retryTimeoutId?: ReturnType<typeof setTimeout>;
+}
 
-// Simple logging helper
-const log = (id: string | "server", msg: string, ...args: any[]) =>
-    console.log(`[${id}] ${msg}`, ...args);
+// --- Component ---
+export default function ShareOverlay() {
+    const [clients, setClients] = useState<Record<string, ClientState>>({});
+    // Use Refs for non-serializable objects or things that shouldn't trigger re-renders on change
+    const peerConnections = useRef<Map<string, { pc: RTCPeerConnection, dc: RTCDataChannel }>>(new Map());
+    const htmlCache = useRef<string | null>(null);
 
-/* ───────── Viewer Page (Served over HTTPS) ───────── */
-
-const viewerHTML = /* html */ `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Live Viewer</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    /* Basic styling for viewer */
-    html, body { margin: 0; height: 100%; background: #111; color: #eee; font-family: monospace; overflow: hidden; }
-    #view { width: 100%; height: 100%; border: none; display: block; background-color: #222; }
-    #hud  { position: fixed; top: 8px; left: 8px; background: #000c; padding: 6px 10px;
-            border-radius: 6px; font-size: 12px; line-height: 1.4; max-width: 85vw; z-index: 10;
-            border: 1px solid #333; }
-    #log  { position: fixed; bottom: 0; left: 0; right: 0; max-height: 40vh; overflow-y: auto;
-            background: #000c; margin: 0; padding: 8px 10px; font-size: 11px; line-height: 1.4; z-index: 10;
-            border-top: 1px solid #333; }
-    #log::before { content: "Event Log:"; display: block; font-weight: bold; margin-bottom: 4px; color: #0f0; }
-  </style>
-</head>
-<body>
-  <iframe id="view" sandbox="allow-scripts allow-same-origin"></iframe>
-  <div id="hud">Initializing...</div>
-  <pre id="log"></pre>
-
-  <script type="module">
-    const hud = document.getElementById('hud');
-    const logBox = document.getElementById('log');
-    const viewFrame = document.getElementById('view');
-
-    // --- Logging ---
-    const log = (...args) => {
-      const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)).join(' ');
-      const timestamp = new Date().toLocaleTimeString();
-      logBox.textContent += \`[\${timestamp}] \${message}\n\`;
-      logBox.scrollTop = logBox.scrollHeight; // Auto-scroll
-      console.log('[Client]', ...args);
-    };
-    const step = (status) => {
-      hud.textContent = status;
-      log('[Status]', status);
-    };
-
-    // --- Configuration ---
-    const WS_URL = location.origin.replace(/^http/, 'ws'); // Dynamically determine WebSocket URL
-    const STUN_SERVERS = [ // Use multiple STUN servers for better reliability
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-    ];
-
-    // --- State ---
-    let ws; // WebSocket connection
-    let pc; // RTCPeerConnection
-    let dc; // RTCDataChannel
-    let myId = null; // Unique ID assigned by the server
-
-    // --- WebSocket Handling ---
-    function connectWebSocket() {
-      step('Connecting WebSocket...');
-      log('[WS] Attempting connection to:', WS_URL);
-      ws = new WebSocket(WS_URL);
-
-      ws.onopen = () => {
-        log('[WS] Connection opened');
-        step('WebSocket connected. Joining as client...');
-        // Identify role to the server
-        ws.send(JSON.stringify({ type: 'join', role: 'client' }));
-      };
-
-      ws.onmessage = async (event) => {
-        let msg;
-        try {
-          msg = JSON.parse(event.data);
-          log('[WS] Received:', msg.type, msg);
-        } catch (e) {
-          log('[WS] Error parsing message:', e, event.data);
-          return;
-        }
-
-        switch (msg.type) {
-          case 'client-id':
-            myId = msg.id;
-            step(\`Registered with ID: \${myId}\`);
-            log('[WS] Received client ID:', myId);
-            // Now that we have an ID, set up the peer connection
-            initializePeerConnection();
-            break;
-
-          case 'offer':
-            if (!pc) {
-              log('[Error] Offer received but PeerConnection not ready!');
-              return;
+    // --- State Update Helpers (Memoized) ---
+    const patchClient = useCallback((id: string, patch: Partial<Omit<ClientState, 'id'>>) => {
+        setClients(prevClients => {
+            const current = prevClients[id];
+            if (!current) return prevClients; // Ignore if client left
+            // Only update if values actually changed to prevent unnecessary renders
+            const newState = { ...current, ...patch };
+            for(const key in patch) {
+                if (newState[key] !== current[key]) {
+                    return { ...prevClients, [id]: newState }; // Update if any patched value changed
+                }
             }
-            if (pc.signalingState !== 'stable' && pc.signalingState !== 'have-remote-offer') {
-                 log('[Warn] Received offer in unexpected state:', pc.signalingState);
-                 // Potentially reset connection or handle gracefully
-            }
-            step('Offer received, processing...');
-            try {
-              await pc.setRemoteDescription(new RTCSessionDescription(msg.offer));
-              log('[PC] Remote description (offer) set');
-              step('Creating answer...');
-              const answer = await pc.createAnswer();
-              log('[PC] Answer created');
-              await pc.setLocalDescription(answer);
-              log('[PC] Local description (answer) set');
-              step('Answer created, sending...');
-              ws.send(JSON.stringify({ type: 'answer', id: myId, answer: pc.localDescription }));
-              log('[WS] Sent answer');
-              step('Answer sent');
-            } catch (e) {
-              log('[PC] Error processing offer/answer:', e);
-              step('Error processing offer');
-              // Consider sending an error back to the host
-            }
-            break;
-
-          case 'ice':
-            if (!pc) {
-              log('[Error] ICE candidate received but PeerConnection not ready!');
-              return;
-            }
-            if (msg.candidate) {
-              try {
-                await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-                // log('[PC] Added ICE candidate:', msg.candidate);
-              } catch (e) {
-                 // Often ignorable, especially late candidates or minor format issues
-                 if (e.name !== 'OperationError' && !e.message.includes("SyntaxError")) { // Filter common non-fatal errors
-                      log('[PC] Error adding ICE candidate:', e.name, e.message, msg.candidate);
-                 }
-              }
-            } else {
-                 log('[PC] Received null ICE candidate (end of candidates signal)');
-            }
-            break;
-
-          default:
-            log('[WS] Received unknown message type:', msg.type);
-        }
-      };
-
-      ws.onerror = (event) => {
-        log('[WS] WebSocket error:', event);
-        step('WebSocket error!');
-      };
-
-      ws.onclose = (event) => {
-        log('[WS] WebSocket closed:', event.code, event.reason, 'Clean:', event.wasClean);
-        step(\`WebSocket closed (\${event.code})\`);
-        // Optional: Implement reconnection logic here
-        pc?.close(); // Close peer connection if WebSocket drops
-        pc = null;
-        dc = null;
-      };
-    }
-
-    // --- WebRTC PeerConnection Handling ---
-    function initializePeerConnection() {
-      if (pc) {
-        log('[PC] PeerConnection already exists. Closing previous.');
-        pc.close();
-      }
-      log('[PC] Initializing PeerConnection...');
-      step('Initializing WebRTC...');
-      try {
-          pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
-          log('[PC] PeerConnection created.');
-
-          // Log state changes for debugging
-          pc.onconnectionstatechange = () => {
-              log('[PC] Connection State:', pc.connectionState);
-              step(\`WebRTC state: \${pc.connectionState}\`);
-              if (pc.connectionState === 'failed') {
-                 log('[PC] Connection failed. Restarting ICE...');
-                 pc.restartIce(); // Attempt to recover
-              }
-          };
-          pc.oniceconnectionstatechange = () => log('[PC] ICE Connection State:', pc.iceConnectionState);
-          pc.onicegatheringstatechange = () => log('[PC] ICE Gathering State:', pc.iceGatheringState);
-          pc.onsignalingstatechange = () => log('[PC] Signaling State:', pc.signalingState);
-          pc.onnegotiationneeded = () => log('[PC] Negotiation needed'); // Should typically be handled by offerer
-
-          // Handle incoming ICE candidates: send them to the host via WebSocket
-          pc.onicecandidate = (event) => {
-            if (event.candidate && myId && ws && ws.readyState === WebSocket.OPEN) {
-              // log('[PC] Sending ICE candidate:', event.candidate);
-              ws.send(JSON.stringify({ type: 'ice', id: myId, candidate: event.candidate }));
-            } else if (!event.candidate) {
-                log('[PC] ICE gathering complete.');
-            }
-          };
-
-           pc.onicecandidateerror = (event) => {
-                 log('[PC] ICE Candidate Error:', event.errorCode, event.errorText);
-           }
-
-          // Handle the data channel being created by the host
-          pc.ondatachannel = (event) => {
-            log('[PC] DataChannel received:', event.channel.label);
-            dc = event.channel;
-            setupDataChannelHandlers();
-          };
-
-      } catch (e) {
-          log('[PC] Error creating PeerConnection:', e);
-          step('Error creating WebRTC connection');
-      }
-    }
-
-    // --- WebRTC DataChannel Handling ---
-    function setupDataChannelHandlers() {
-      if (!dc) return;
-      log('[DC] Setting up DataChannel handlers');
-
-      dc.onopen = () => {
-        log('[DC] DataChannel opened');
-        step('Data channel open - ready for HTML');
-        // **REMOVED**: No longer sending 'data-open' via WebSocket
-      };
-
-      dc.onmessage = (event) => {
-        let msg;
-        try {
-          msg = JSON.parse(event.data);
-          log('[DC] Received:', msg.kind);
-
-          if (msg.kind === 'html') {
-            step('HTML received, rendering...');
-            viewFrame.srcdoc = msg.payload; // Render HTML in the iframe
-            step('HTML applied ✔');
-            // **CHANGED**: Send acknowledgment back via the DataChannel
-            if (dc.readyState === 'open') {
-              dc.send(JSON.stringify({ type: 'html-ack' }));
-              log('[DC] Sent html-ack');
-            } else {
-              log('[DC] Cannot send html-ack, channel state:', dc.readyState);
-            }
-             // **REMOVED**: No longer sending 'html-ack' via WebSocket
-          } else {
-              log('[DC] Received unknown message kind:', msg.kind);
-          }
-        } catch (e) {
-          log('[DC] Error processing message:', e, event.data);
-          step('Error processing received data');
-        }
-      };
-
-      dc.onerror = (error) => {
-        log('[DC] DataChannel error:', error);
-        step('Data channel error');
-      };
-
-      dc.onclose = () => {
-        log('[DC] DataChannel closed');
-        step('Data channel closed');
-        dc = null; // Clear reference
-      };
-    }
-
-    // --- Start the process ---
-    connectWebSocket();
-
-  </script>
-</body>
-</html>
-`;
-
-/* ───────── Bun Server (HTTP + WebSocket) ───────── */
-
-const PORT = process.env.PORT || 5050;
-
-Bun.serve<WebSocketMeta>({
-    port: Number(PORT),
-
-    /* Handle HTTP requests -> Serve the viewer HTML */
-    fetch(req, server) {
-        // Upgrade to WebSocket if requested
-        if (server.upgrade(req)) {
-            return; // Bun handles the response for upgrades
-        }
-        // Otherwise, serve the HTML page
-        log('server', `HTTP request from ${req.headers.get('x-forwarded-for') || req.remoteAddress}`);
-        return new Response(viewerHTML, {
-            headers: { "Content-Type": "text/html; charset=utf-8" },
+            return prevClients; // No change detected in patched fields
         });
-    },
+    }, []); // No dependencies, safe to memoize
 
-    /* Handle WebSocket connections */
-    websocket: {
-        /* Handle incoming messages */
-        message(ws: ServerWebSocket<WebSocketMeta>, messageData) {
-            const messageText = messageData instanceof Buffer ? messageData.toString() : typeof messageData === 'string' ? messageData : '';
+    const removeClient = useCallback((id: string) => {
+        console.log(`[${id}] Removing client and closing connections.`);
+        const connection = peerConnections.current.get(id);
+        if (connection) {
+            // Clear any pending retry timeouts first
+             setClients(prev => {
+                 if (prev[id]?.retryTimeoutId) {
+                     clearTimeout(prev[id].retryTimeoutId);
+                     console.log(`[${id}] Cleared pending retry timeout during removal.`);
+                 }
+                 // Return previous state as we only want the side effect of clearing timeout
+                 return prev;
+             })
+
+            connection.dc?.close();
+            connection.pc?.close();
+            peerConnections.current.delete(id);
+        }
+        setClients(prevClients => {
+            const { [id]: _, ...rest } = prevClients;
+            return rest;
+        });
+    }, []); // No dependencies, safe to memoize
+
+    // --- QR Code Generation (Memoized) ---
+    const qrSvg = useMemo(() => {
+        console.log('[Host] Generating QR Code for:', VIEWER_URL);
+        return new QRCode({
+            content: VIEWER_URL, padding: 1, join: true, container: "svg",
+            width: 128, height: 128, color: "#FFFFFF", background: "#00000000"
+        }).svg();
+    }, []);
+
+    // --- HTML Fetching & Caching ---
+    const fetchAndCacheHtml = useCallback(async (): Promise<string> => {
+        if (htmlCache.current) return htmlCache.current;
+        try {
+            console.log('[Host] Fetching HTML from:', HTML_URL);
+            const response = await fetch(HTML_URL);
+            if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+            const html = await response.text();
+            htmlCache.current = html; // Cache it
+            console.log('[Host] HTML fetched and cached.');
+            return html;
+        } catch (error) {
+            console.error('[Host] Failed to fetch HTML:', error);
+            return `<html><body><h1>Error loading content</h1><p>${error.message}</p></body></html>`;
+        }
+    }, []);
+
+    // Pre-fetch HTML on component mount
+    useEffect(() => {
+        fetchAndCacheHtml();
+    }, [fetchAndCacheHtml]);
+
+    // --- Send HTML Logic (Memoized) ---
+    const sendHtmlToClient = useCallback(async (clientId: string) => {
+        console.log(`[${clientId}] Preparing to send HTML.`);
+        const connection = peerConnections.current.get(clientId);
+        // Need latest state for retry count and stage check
+        let currentRetryCount = 0;
+        let currentStage : ClientStage | undefined = undefined;
+        setClients(prev => {
+             currentRetryCount = prev[clientId]?.htmlSendRetries ?? 0;
+             currentStage = prev[clientId]?.stage;
+             return prev; // No state change here, just reading
+        });
+
+
+        if (!connection || !connection.dc) {
+            console.error(`[${clientId}] No data channel found for sending HTML.`);
+            patchClient(clientId, { stage: "failed" }); return;
+        }
+        const { dc } = connection;
+
+        if (dc.readyState !== 'open') {
+            console.warn(`[${clientId}] Data channel not open (state=${dc.readyState}). Cannot send HTML yet.`);
+            return;
+        }
+        if (currentStage === 'html-acked') {
+             console.log(`[${clientId}] HTML already acknowledged. Skipping send.`); return;
+        }
+        if (currentRetryCount >= MAX_HTML_RETRIES) {
+            console.error(`[${clientId}] Max HTML send retries (${MAX_HTML_RETRIES}) reached.`);
+            patchClient(clientId, { stage: "failed" }); return;
+        }
+
+        // Update stage and increment retry count *before* sending
+        patchClient(clientId, { stage: "sending-html", htmlSendRetries: currentRetryCount + 1 });
+
+        const htmlContent = htmlCache.current ?? await fetchAndCacheHtml();
+        const payload = JSON.stringify({ kind: "html", payload: htmlContent });
+
+        try {
+            console.log(`[${clientId}] Sending HTML via DataChannel (attempt ${currentRetryCount + 1}).`);
+            dc.send(payload);
+
+             // Clear previous timeout using setClients to access the latest state
+             let existingTimeoutId: ReturnType<typeof setTimeout> | undefined;
+             setClients(prev => {
+                 existingTimeoutId = prev[clientId]?.retryTimeoutId;
+                 return prev;
+             });
+             if (existingTimeoutId) {
+                  clearTimeout(existingTimeoutId);
+             }
+
+
+            // Set a *new* timeout to check for ACK
+            const timeoutId = setTimeout(() => {
+                // Check stage again *inside* the timeout callback using setClients
+                let stageToCheck : ClientStage | undefined;
+                 setClients(currentClients => {
+                    stageToCheck = currentClients[clientId]?.stage;
+                    return currentClients; // No state change needed here
+                });
+
+                 if (stageToCheck && stageToCheck !== 'html-acked') {
+                     console.warn(`[${clientId}] HTML ACK not received within ${RETRY_DELAY_MS}ms. Retrying...`);
+                     sendHtmlToClient(clientId); // Retry (will increment count again)
+                 } else {
+                      // console.log(`[${clientId}] ACK received or client gone before timeout fired.`);
+                 }
+
+            }, RETRY_DELAY_MS);
+
+            // Store the new timeout ID
+            patchClient(clientId, { retryTimeoutId: timeoutId });
+
+        } catch (error) {
+            console.error(`[${clientId}] Error sending HTML via DataChannel:`, error);
+             patchClient(clientId, { stage: "failed" });
+              // Also clear timeout on error
+             setClients(prev => {
+                 if (prev[clientId]?.retryTimeoutId) clearTimeout(prev[clientId].retryTimeoutId);
+                 return { ...prev, [clientId]: { ...(prev[clientId]!), retryTimeoutId: undefined } };
+             });
+        }
+    }, [fetchAndCacheHtml, patchClient]); // Dependencies
+
+    // --- Main Effect for WebSocket and Peer Connection Setup ---
+    useEffect(() => {
+        console.log('[Host] Initializing WebSocket connection...');
+        // Create WebSocket instance directly scoped to this effect
+        const ws = new WebSocket(WS_URL);
+        let wsOpened = false; // Track if connection succeeded initially
+
+        // --- PeerConnection Creation Function (scoped to useEffect) ---
+        async function createPeerConnection(clientId: string) {
+             console.log(`[${clientId}] Creating RTCPeerConnection...`);
+            // Clean up any previous connection for this ID just in case
+             if (peerConnections.current.has(clientId)) {
+                 console.warn(`[${clientId}] Existing PeerConnection found. Cleaning up before creating new one.`);
+                 removeClient(clientId); // Use the callback to ensure proper cleanup
+             }
+
+             try {
+                 const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
+                 const dc = pc.createDataChannel("data"); // Create data channel immediately
+                 console.log(`[${clientId}] PC and DC created.`);
+
+                 // Store refs
+                 peerConnections.current.set(clientId, { pc, dc });
+                 // Update initial state
+                  patchClient(clientId, {
+                     stage: "pc-created", pcState: pc.connectionState,
+                     iceState: pc.iceConnectionState, sigState: pc.signalingState
+                 });
+
+
+                 // --- Data Channel Handlers ---
+                 dc.onopen = () => {
+                     console.log(`[${clientId}][DC] Opened.`);
+                     patchClient(clientId, { stage: "data-open", htmlSendRetries: 0 }); // Reset retries
+                     setClients(prev => { // Clear any lingering timeout
+                        if(prev[clientId]?.retryTimeoutId) clearTimeout(prev[clientId].retryTimeoutId);
+                        return { ...prev, [clientId]: { ...(prev[clientId]!), retryTimeoutId: undefined } };
+                     });
+                     sendHtmlToClient(clientId); // Send HTML now
+                 };
+                 dc.onclose = () => {
+                     console.log(`[${clientId}][DC] Closed.`);
+                     patchClient(clientId, { stage: "closed" });
+                 };
+                 dc.onerror = (error) => {
+                     console.error(`[${clientId}][DC] Error:`, error);
+                     patchClient(clientId, { stage: "failed" });
+                 };
+                 dc.onmessage = (event) => { // Listen for ACK
+                     try {
+                         const msg = JSON.parse(event.data);
+                         if (msg.type === 'html-ack') {
+                             console.log(`[${clientId}][DC] Received html-ack.`);
+                             // Clear pending retry timeout and update stage
+                             setClients(prev => {
+                                 const client = prev[clientId];
+                                 if (client?.retryTimeoutId) clearTimeout(client.retryTimeoutId);
+                                 return { ...prev, [clientId]: { ...client, stage: 'html-acked', retryTimeoutId: undefined } };
+                             });
+                         } else {
+                              console.warn(`[${clientId}][DC] Received unknown msg type:`, msg.type);
+                         }
+                     } catch (e) { console.error(`[${clientId}][DC] Failed to parse message:`, e); }
+                 };
+
+                 // --- Peer Connection Handlers ---
+                 pc.onicecandidate = (event) => {
+                     if (event.candidate && ws?.readyState === WebSocket.OPEN) {
+                         ws.send(JSON.stringify({ type: "ice", id: clientId, candidate: event.candidate }));
+                     }
+                 };
+                  pc.onicecandidateerror = (event) => console.error(`[${clientId}][PC] ICE Error:`, event.errorCode, event.errorText);
+                 pc.onconnectionstatechange = () => {
+                      console.log(`[${clientId}][PC] State: ${pc.connectionState}`);
+                      patchClient(clientId, { pcState: pc.connectionState });
+                     switch (pc.connectionState) {
+                         case "connected": patchClient(clientId, { stage: "pc-connected" }); break;
+                         case "failed": patchClient(clientId, { stage: "failed" }); pc.restartIce(); break; // Attempt restart
+                         case "closed": patchClient(clientId, { stage: "closed" }); removeClient(clientId); break;
+                         case "disconnected": patchClient(clientId, { stage: "connecting" }); break; // May recover
+                     }
+                 };
+                 pc.oniceconnectionstatechange = () => patchClient(clientId, { iceState: pc.iceConnectionState });
+                 pc.onsignalingstatechange = () => patchClient(clientId, { sigState: pc.signalingState });
+
+                 // --- Create and Send Offer ---
+                 console.log(`[${clientId}] Creating offer...`);
+                 const offer = await pc.createOffer();
+                 await pc.setLocalDescription(offer);
+                  patchClient(clientId, { sigState: pc.signalingState });
+                 console.log(`[${clientId}] Offer created and set. Sending via WS...`);
+                 if (ws?.readyState === WebSocket.OPEN) {
+                     ws.send(JSON.stringify({ type: "offer", id: clientId, offer: pc.localDescription }));
+                     patchClient(clientId, { stage: "offered" });
+                 } else {
+                     console.error(`[${clientId}] WS closed before offer could be sent.`);
+                      patchClient(clientId, { stage: "failed" });
+                      removeClient(clientId); // Clean up unusable PC
+                 }
+
+             } catch (error) {
+                 console.error(`[${clientId}] Failed to create PeerConnection:`, error);
+                 patchClient(clientId, { stage: "failed" });
+                 removeClient(clientId); // Clean up any partial state
+             }
+         } // --- End of createPeerConnection ---
+
+
+        // --- WebSocket Event Handlers ---
+        ws.onopen = () => {
+            wsOpened = true;
+            console.log('[Host][WS] Connection established. Sending join message...');
+            ws.send(JSON.stringify({ type: "join", role: "host" }));
+        };
+
+        ws.onmessage = async (event) => {
             let msg;
             try {
-                msg = JSON.parse(messageText);
-            } catch (e) {
-                log(ws.data.id ?? 'unknown', 'Received invalid JSON', messageText);
-                return;
-            }
+                msg = JSON.parse(event.data as string);
+                 // console.log('[Host][WS] Received:', msg.type, 'for ID:', msg.id);
+            } catch (e) { console.error('[Host][WS] Failed to parse message:', e); return; }
 
-            /* --- Join Handshake --- */
-            if (msg.type === "join") {
-                if (msg.role === "host") {
-                    if (host && host !== ws) {
-                        log('server', 'New host connected, disconnecting previous host.');
-                        host.close(1000, "New host connected"); // Close old host connection
-                    }
-                    host = ws;
-                    ws.data = { role: "host" }; // Assign role to connection metadata
-                    log("host", "WebSocket connected");
-                    // Send any buffered messages to the newly connected host
-                    const buffered = messagesForHost.splice(0); // Atomically get and clear buffer
-                    if (buffered.length > 0) {
-                         log("host", `Sending ${buffered.length} buffered message(s)`);
-                         buffered.forEach(payload => host!.send(payload));
-                    }
-                } else if (msg.role === "client") {
-                    const clientId = nanoid(6); // Generate unique ID for the client
-                    ws.data = { role: "client", id: clientId }; // Assign role and ID
-                    clients.set(clientId, ws); // Store client connection
+            const clientId = msg.id;
+            if (!clientId) { console.warn('[Host][WS] Ignoring message without client ID', msg); return; }
 
-                    // Send the client its unique ID
-                    ws.send(JSON.stringify({ type: "client-id", id: clientId }));
+             const connection = peerConnections.current.get(clientId); // Get existing PC ref if available
 
-                    // Notify the host about the new client
-                    const joinNotice = JSON.stringify({ type: "client-join", id: clientId });
-                    if (host && host.readyState === WebSocket.OPEN) {
-                        host.send(joinNotice);
-                    } else {
-                        messagesForHost.push(joinNotice); // Buffer if host is offline
-                    }
-                    log(clientId, "WebSocket connected");
-
-                    // Send any buffered messages for this specific client
-                     const clientBuffer = messagesForClient[clientId] ?? [];
-                     messagesForClient[clientId] = []; // Clear buffer
-                     if (clientBuffer.length > 0) {
-                         log(clientId, `Sending ${clientBuffer.length} buffered message(s)`);
-                         clientBuffer.forEach(payload => ws.send(payload));
+            switch (msg.type) {
+                case "client-join":
+                     console.log(`[${clientId}][WS] client-join received.`);
+                     patchClient(clientId, { // Set initial state for UI
+                         id: clientId, stage: "ws-connected", pcState: "new",
+                         iceState: "new", sigState: "stable", htmlSendRetries: 0,
+                     });
+                     await createPeerConnection(clientId); // Start WebRTC setup
+                    break;
+                case "answer":
+                    if (connection?.pc) {
+                         console.log(`[${clientId}][WS] answer received. Setting remote description.`);
+                         try {
+                             await connection.pc.setRemoteDescription(msg.answer); // Note: Constructor might not be needed if object is correct
+                              patchClient(clientId, { sigState: connection.pc.signalingState });
+                         } catch (e) { console.error(`[${clientId}] Failed to set remote answer:`, e); patchClient(clientId, {stage: 'failed'}); }
+                    } else { console.warn(`[${clientId}][WS] answer received but no PC found.`); }
+                    break;
+                case "ice":
+                     if (connection?.pc && msg.candidate) {
+                         try {
+                            await connection.pc.addIceCandidate(msg.candidate);
+                         } catch (e) { if (e.name !== 'OperationError' && !e.message.includes("SyntaxError")) console.warn(`[${clientId}] Failed to add ICE:`, e.name); }
                      }
-
-                } else {
-                    log(ws.data.id ?? 'unknown', 'Invalid role specified in join message:', msg.role);
-                    ws.close(1008, "Invalid role");
-                }
-                return; // Join message processed
+                    break;
+                case "client-leave":
+                     console.log(`[${clientId}][WS] client-leave received.`);
+                     removeClient(clientId);
+                    break;
+                default:
+                    console.log(`[${clientId}][WS] Received unhandled type: ${msg.type}`);
             }
+        };
 
-            /* --- Message Relaying --- */
-            const senderRole = ws.data.role;
-            const senderId = ws.data.id; // Will be undefined for host
+        ws.onerror = (event) => {
+            console.error('[Host][WS] WebSocket error:', event);
+            // Consider updating UI or attempting reconnect here if needed
+        };
 
-            if (senderRole === "host") {
-                // Message FROM host TO a specific client
-                const targetClientId = msg.id;
-                if (!targetClientId) {
-                     log('host', 'Received message without target client ID', msg);
-                     return;
-                }
-                const targetClient = clients.get(targetClientId);
-                log('host', `Relaying '${msg.type}' to client ${targetClientId}`);
-                if (targetClient && targetClient.readyState === WebSocket.OPEN) {
-                    targetClient.send(messageText); // Forward directly
-                } else {
-                    // Buffer message if client is offline or not found yet
-                    log('host', `Client ${targetClientId} offline, buffering message`);
-                    if (!messagesForClient[targetClientId]) {
-                        messagesForClient[targetClientId] = [];
-                    }
-                    messagesForClient[targetClientId].push(messageText);
-                }
-            } else if (senderRole === "client" && senderId) {
-                // Message FROM a client TO the host
-                msg.id = senderId; // Add/overwrite client ID for host context
-                const payloadWithId = JSON.stringify(msg);
-                log(senderId, `Relaying '${msg.type}' to host`);
-                if (host && host.readyState === WebSocket.OPEN) {
-                    host.send(payloadWithId); // Forward directly
-                } else {
-                    // Buffer message if host is offline
-                    log(senderId, 'Host offline, buffering message');
-                    messagesForHost.push(payloadWithId);
-                }
-            } else {
-                 log(senderId ?? 'unknown', 'Received message from socket with unknown/missing role');
+        ws.onclose = (event) => {
+            console.log(`[Host][WS] WebSocket closed. Code: ${event.code}, Reason: "${event.reason}", Clean: ${event.wasClean}, Opened: ${wsOpened}`);
+            if (!wsOpened && event.code === 1006) {
+                 console.error("[Host][WS] CONNECTION FAILED (1006). Check Server/URL/Network/TLS.");
+                 // Maybe set a global error state for the UI
             }
-        },
+             // Clean up all clients when WebSocket closes unexpectedly? Or allow them to persist for reconnect?
+             // For simplicity now, we don't clear clients here, only on explicit leave or component unmount.
+        };
 
-        /* Handle WebSocket closing */
-        close(ws: ServerWebSocket<WebSocketMeta>, code, reason) {
-            const role = ws.data.role;
-            const id = ws.data.id;
-
-            if (role === "host") {
-                log("host", `WebSocket closed (${code})`);
-                if (host === ws) { // Ensure it's the current host being closed
-                    host = undefined;
-                }
-            } else if (role === "client" && id) {
-                log(id, `WebSocket closed (${code})`);
-                clients.delete(id); // Remove from active clients
-                delete messagesForClient[id]; // Clear any pending message buffer for this client
-
-                // Notify the host that the client left
-                const leaveNotice = JSON.stringify({ type: "client-leave", id });
-                if (host && host.readyState === WebSocket.OPEN) {
-                    host.send(leaveNotice);
-                } else {
-                    messagesForHost.push(leaveNotice); // Buffer if host is offline
-                }
-            } else {
-                 log('unknown', `WebSocket closed (${code}) for socket without role/id`);
+        // --- Effect Cleanup ---
+        return () => {
+            console.log('[Host] Cleaning up: Closing WebSocket and all PeerConnections...');
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+                 ws.close(1000, "Host component unmounting");
             }
-        },
+            // Close all active peer connections and clear timeouts
+            peerConnections.current.forEach((conn, id) => {
+                console.log(`[${id}] Closing connections during cleanup.`);
+                // Clear timeout using setClients state access
+                setClients(prev => {
+                     if (prev[id]?.retryTimeoutId) clearTimeout(prev[id].retryTimeoutId);
+                     return prev; // No state change needed
+                 });
+                conn.dc?.close();
+                conn.pc?.close();
+            });
+            peerConnections.current.clear(); // Clear the ref map
+            setClients({}); // Clear UI state
+            console.log('[Host] Cleanup complete.');
+        };
+    // }, []); // <-- Original empty array caused issues with callbacks using stale state
+    // Depend on memoized callbacks to ensure they have access to latest state/refs if needed
+    }, [patchClient, removeClient, sendHtmlToClient]);
 
-        /* Handle WebSocket errors */
-        error(ws: ServerWebSocket<WebSocketMeta>, error) {
-             log(ws.data.id ?? (ws.data.role === 'host' ? 'host' : 'unknown'), 'WebSocket error:', error);
-        }
-    },
-});
-
-log('server', `Relay & Viewer server running on http://localhost:${PORT}`);
+    // --- Render UI ---
+    return (
+        <div style={{ width: "100%", height: "100%", position: "relative", background: "#333" }}>
+            {/* Local Preview Iframe */}
+            <iframe src={HTML_URL} style={{ width: "100%", height: "100%", border: "none", display: "block" }} title="Local HTML Preview" />
+            {/* QR Code Overlay */}
+            <div style={{ position: "absolute", bottom: "20px", left: "50%", transform: "translateX(-50%)", background: "rgba(0, 0, 0, 0.7)", padding: "10px", borderRadius: "8px", border: "1px solid #555" }} dangerouslySetInnerHTML={{ __html: qrSvg }} />
+            {/* Client Status Roster */}
+            <div style={{ position: "absolute", top: "10px", right: "10px", width: "350px", maxHeight: "80vh", overflowY: "auto", backgroundColor: "rgba(31, 41, 55, 0.85)", backdropFilter: "blur(3px)", color: "white", padding: "12px", borderRadius: "12px", fontSize: "12px", border: "1px solid rgba(255, 255, 255, 0.2)", fontFamily: "monospace" }}>
+                <div style={{ fontWeight: "bold", marginBottom: "8px", borderBottom: "1px solid #555", paddingBottom: "4px" }}>Clients ({Object.keys(clients).length})</div>
+                {Object.keys(clients).length === 0 && <div style={{ fontStyle: "italic", color: "#aaa" }}>Scan QR code...</div>}
+                {Object.values(clients).map(({ id, stage, pcState, iceState, sigState, htmlSendRetries }) => (
+                    <div key={id} style={{ display: "grid", gridTemplateColumns: "4.5rem 7rem 5.5rem 5.5rem 4rem", gap: "6px", padding: "4px 2px", borderBottom: "1px dashed #444", opacity: (stage === 'closed' || stage === 'failed') ? 0.5 : 1 }} title={`ID: ${id}\nStage: ${stage}\nPC State: ${pcState}\nICE State: ${iceState}\nSig State: ${sigState}\nRetries: ${htmlSendRetries -1}`}> {/* Show 0-based retries */}
+                        <span style={{ fontWeight: "bold", color: "#90ee90" }}>{id}</span>
+                        <span style={{ color: stage === 'html-acked' ? '#0f0' : (stage === 'failed' ? '#f00' : '#ffcc66') }}>{stage}</span>
+                        <span style={{ fontStyle: "italic", color: pcState === 'connected' ? '#7f7' : (pcState === 'failed' ? '#f77' : '#ccc') }}>{pcState}</span>
+                        <span style={{ fontStyle: "italic", color: '#aaa' }}>{iceState}</span>
+                        <span style={{ fontStyle: "italic", color: '#aaa' }}>{(stage === 'sending-html' || stage === 'html-acked') ? `Try:${htmlSendRetries}` : '-'}</span> {/* Show retry attempt# */}
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
